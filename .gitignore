@@ -17,3 +17,4 @@ summary.csv
 # pycache
 __pycache__/
 *.pyc
+.idea/
