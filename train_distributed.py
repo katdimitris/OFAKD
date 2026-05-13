@@ -924,67 +924,52 @@ def train_one_epoch(
 
 
 def validate_distiller_losses(distiller, loader, args, amp_autocast=suppress):
-    losses_m = AverageMeter()
     kd_loss_m = AverageMeter()
-    dist_loss_m = AverageMeter()
 
     distiller_was_training = distiller.training
     distiller.eval()
 
+    module = distiller.module if hasattr(distiller, 'module') else distiller
+    student = module.student
+    teacher = module.teacher
+    temperature = args.kd_temperature
+
     with torch.no_grad():
         for batch in loader:
             input, target, *additional_input = batch
+
             if not args.prefetcher:
                 input = input.to(args.device, non_blocking=True)
-                target = target.to(args.device, non_blocking=True)
-                additional_input = [i.to(args.device, non_blocking=True) for i in additional_input]
 
             with amp_autocast():
-                _, losses_dict = distiller(input, target, *additional_input, epoch=0)
-                loss = sum(losses_dict.values())
+                logits_student = student(input)
+                logits_teacher = teacher(input)
+
+                if isinstance(logits_student, (tuple, list)):
+                    logits_student = logits_student[0]
+                if isinstance(logits_teacher, (tuple, list)):
+                    logits_teacher = logits_teacher[0]
+
+                kd_loss = torch.nn.functional.kl_div(
+                    torch.nn.functional.log_softmax(logits_student / temperature, dim=1),
+                    torch.nn.functional.softmax(logits_teacher / temperature, dim=1),
+                    reduction='batchmean'
+                ) * (temperature ** 2) * args.kd_loss_weight
 
             if args.distributed:
-                reduced_loss = reduce_tensor(loss.data, args.world_size)
+                kd_loss = reduce_tensor(kd_loss.data, args.world_size)
             else:
-                reduced_loss = loss.data
-            losses_m.update(reduced_loss.item(), input.size(0))
+                kd_loss = kd_loss.data
 
-            kd_value = None
-            for k, v in losses_dict.items():
-                key = k.lower()
-                if key in ('kd', 'loss_kd', 'kd_loss', 'dist', 'dist_loss'):
-                    kd_value = v
-                    break
-
-            if kd_value is not None:
-                if args.distributed:
-                    kd_value = reduce_tensor(kd_value.data, args.world_size)
-                else:
-                    kd_value = kd_value.data
-                kd_loss_m.update(kd_value.item(), input.size(0))
-
-            dist_components = []
-            for k, v in losses_dict.items():
-                key = k.lower()
-                if key not in ('gt', 'ce', 'cls', 'loss_gt', 'ce_loss', 'cls_loss'):
-                    dist_components.append(v)
-            if dist_components:
-                dist_value = sum(dist_components)
-                if args.distributed:
-                    dist_value = reduce_tensor(dist_value.data, args.world_size)
-                else:
-                    dist_value = dist_value.data
-                dist_loss_m.update(dist_value.item(), input.size(0))
+            kd_loss_m.update(kd_loss.item(), input.size(0))
 
     if distiller_was_training:
         distiller.train()
 
-    metrics = OrderedDict([('distiller_loss', losses_m.avg)])
-    if kd_loss_m.count > 0:
-        metrics['kd_loss'] = kd_loss_m.avg
-    if dist_loss_m.count > 0:
-        metrics['dist_loss'] = dist_loss_m.avg
-    return metrics
+    return OrderedDict([
+        ('dist_loss', kd_loss_m.avg),
+        ('kd_loss', kd_loss_m.avg),
+    ])
 
 
 def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix=''):
