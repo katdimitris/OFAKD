@@ -372,6 +372,33 @@ def _parse_args():
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
     return args, args_text
 
+def resume_checkpoint_full(model, checkpoint_path, optimizer=None, loss_scaler=None, log_info=True):
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+    state_dict = checkpoint.get('state_dict', checkpoint)
+
+    if any(k.startswith('module.') for k in state_dict.keys()):
+        state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict, strict=True)
+
+    if optimizer is not None and 'optimizer' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+
+    if loss_scaler is not None:
+        if 'amp_scaler' in checkpoint:
+            loss_scaler.load_state_dict(checkpoint['amp_scaler'])
+        elif 'scaler' in checkpoint:
+            loss_scaler.load_state_dict(checkpoint['scaler'])
+
+    resume_epoch = checkpoint.get('epoch', 0)
+    if checkpoint.get('version', 1) > 1:
+        resume_epoch += 1
+
+    if log_info:
+        _logger.info(f'Loaded checkpoint {checkpoint_path}; resume_epoch={resume_epoch}')
+
+    return resume_epoch
 
 def main():
     setup_default_logging(log_path='train.log')
@@ -610,7 +637,7 @@ def main():
     if args.resume:
         resume_path = os.path.join(output_dir, 'checkpoint', 'last.pth.tar')
         if os.path.exists(resume_path):
-            resume_epoch = resume_checkpoint(
+            resume_epoch = resume_checkpoint_full(
                 distiller,
                 resume_path,
                 optimizer=optimizer,
