@@ -37,7 +37,8 @@ import yaml
 from timm.data import AugMixDataset, create_dataset, create_loader, FastCollateMixup, Mixup, \
     resolve_data_config
 from timm.loss import *
-from timm.models import convert_splitbn_model, create_model, model_parameters, safe_model_name, load_checkpoint
+from timm.models import convert_splitbn_model, create_model, model_parameters, safe_model_name, load_checkpoint, \
+    resume_checkpoint
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
 from timm.utils import *
@@ -352,7 +353,8 @@ parser.add_argument("--local_rank", default=0, type=int)
 parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
 parser.add_argument('--use-multi-epochs-loader', action='store_true', default=False,
                     help='use the multi-epochs-loader to save time at the beginning of every epoch')
-
+parser.add_argument('--resume', action='store_true', default=False,
+                    help='Auto-resume from checkpoint/last.pth.tar inside the current experiment folder.')
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -379,10 +381,12 @@ def main():
     args.distributed = False
     if 'WORLD_SIZE' in os.environ:
         args.distributed = int(os.environ['WORLD_SIZE']) > 1
+
     args.local_rank = int(os.environ.get('LOCAL_RANK', args.local_rank))
     args.device = torch.device('cuda', args.local_rank)
     args.world_size = 1
-    args.rank = 0  # global rank
+    args.rank = 0
+
     if args.distributed:
         assert 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
         args.rank = int(os.environ["RANK"])
@@ -392,34 +396,40 @@ def main():
 
         torch.cuda.set_device(args.local_rank)
 
-        torch.distributed.init_process_group(backend='nccl', init_method=args.dist_url,
-                                             world_size=args.world_size, rank=args.rank)
+        torch.distributed.init_process_group(
+            backend='nccl',
+            init_method=args.dist_url,
+            world_size=args.world_size,
+            rank=args.rank,
+        )
         torch.distributed.barrier()
 
-        _logger.info('Training in distributed mode with multiple processes, 1 GPU per process. Process %d, total %d.'
-                     % (args.rank, args.world_size))
-
+        _logger.info(
+            'Training in distributed mode with multiple processes, 1 GPU per process. Process %d, total %d.'
+            % (args.rank, args.world_size)
+        )
     else:
         _logger.info('Training with a single process on 1 GPUs.')
 
     torch.cuda.set_device(args.local_rank)
     assert args.rank >= 0
 
-    # resolve AMP arguments based on PyTorch / Apex availability
     use_amp = None
     if args.amp:
-        # `--amp` chooses native amp before apex (APEX ver not actively maintained)
         if has_native_amp:
             args.native_amp = True
         elif has_apex:
             args.apex_amp = True
+
     if args.apex_amp and has_apex:
         use_amp = 'apex'
     elif args.native_amp and has_native_amp:
         use_amp = 'native'
     elif args.apex_amp or args.native_amp:
-        _logger.warning("Neither APEX or native Torch AMP is available, using float32. "
-                        "Install NVIDA apex or upgrade to PyTorch 1.6")
+        _logger.warning(
+            "Neither APEX or native Torch AMP is available, using float32. "
+            "Install NVIDA apex or upgrade to PyTorch 1.6"
+        )
 
     random_seed(args.seed, args.rank)
 
@@ -430,21 +440,20 @@ def main():
         pretrained=args.pretrained,
         num_classes=args.num_classes,
         drop_rate=args.drop,
-        drop_connect_rate=args.drop_connect,  # DEPRECATED, use drop_path
+        drop_connect_rate=args.drop_connect,
         drop_path_rate=args.drop_path,
         drop_block_rate=args.drop_block,
         global_pool=args.gp,
         bn_momentum=args.bn_momentum,
         bn_eps=args.bn_eps,
-        checkpoint_path=args.initial_checkpoint)
+        checkpoint_path=args.initial_checkpoint,
+    )
     if Distiller.requires_feat:
         register_new_forward(model)
 
     teacher = None
     if args.teacher:
-        teacher = create_model(
-            args.teacher,
-            num_classes=args.num_classes)
+        teacher = create_model(args.teacher, num_classes=args.num_classes)
         load_checkpoint(teacher, args.teacher_pretrained, use_ema=args.use_ema_teacher)
         if Distiller.requires_feat:
             register_new_forward(teacher)
@@ -454,74 +463,84 @@ def main():
 
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
-        args.num_classes = model.num_classes  # FIXME handle model default vs config num_classes more elegantly
+        args.num_classes = model.num_classes
 
     if args.rank == 0:
         _logger.info(
-            f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
+            f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}'
+        )
 
     data_config = resolve_data_config(vars(args), model=model, verbose=args.rank == 0)
 
-    # setup augmentation batch splits for contrastive loss or split bn
     num_aug_splits = 0
     if args.aug_splits > 0:
         assert args.aug_splits > 1, 'A split of 1 makes no sense'
         num_aug_splits = args.aug_splits
 
-    # enable split bn (separate bn stats per batch-portion)
     if args.split_bn:
         assert num_aug_splits > 1 or args.resplit
         model = convert_splitbn_model(model, max(num_aug_splits, 2))
 
-    # setup synchronized BatchNorm for distributed training
     if args.distributed and args.sync_bn:
         assert not args.split_bn
         if has_apex and use_amp == 'apex':
-            # Apex SyncBN preferred unless native amp is activated
             model = convert_syncbn_model(model)
         else:
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
         if args.rank == 0:
             _logger.info(
                 'Converted model to use Synchronized BatchNorm. WARNING: You may have issues if using '
-                'zero initialized BN layers (enabled by default for ResNets) while sync-bn enabled.')
+                'zero initialized BN layers while sync-bn enabled.'
+            )
 
-    # create the train and eval datasets
     if args.dataset == 'cifar100':
         if args.distiller == 'crd':
             dataset_train = CIFAR100InstanceSample(root=args.data_dir, train=True, is_sample=True, k=args.crd_k)
         else:
             dataset_train = torchvision.datasets.CIFAR100(args.data_dir, train=True)
+
         dataset_eval = torchvision.datasets.CIFAR100(args.data_dir, train=False)
         data_config['mean'] = (0.5071, 0.4865, 0.4409)
         data_config['std'] = (0.2673, 0.2564, 0.2762)
-
     else:
         if args.distiller == 'crd':
-            dataset_train = ImageNetInstanceSample(root=f'{args.data_dir}/train', name=args.dataset,
-                                                   class_map=args.class_map, load_bytes=False, is_sample=True,
-                                                   k=args.crd_k)
+            dataset_train = ImageNetInstanceSample(
+                root=f'{args.data_dir}/train',
+                name=args.dataset,
+                class_map=args.class_map,
+                load_bytes=False,
+                is_sample=True,
+                k=args.crd_k,
+            )
         else:
             dataset_train = create_dataset(
-                args.dataset, root=args.data_dir, split=args.train_split, is_training=True,
+                args.dataset,
+                root=args.data_dir,
+                split=args.train_split,
+                is_training=True,
                 class_map=args.class_map,
                 download=args.dataset_download,
                 batch_size=args.batch_size,
-                repeats=args.epoch_repeats)
+                repeats=args.epoch_repeats,
+            )
 
         dataset_eval = create_dataset(
-            args.dataset, root=args.data_dir, split=args.val_split, is_training=False,
+            args.dataset,
+            root=args.data_dir,
+            split=args.val_split,
+            is_training=False,
             class_map=args.class_map,
             download=args.dataset_download,
-            batch_size=args.batch_size)
+            batch_size=args.batch_size,
+        )
 
-    # setup loss function
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
+
     if args.jsd_loss:
-        assert num_aug_splits > 1  # JSD only valid with aug splits set
+        assert num_aug_splits > 1
         train_loss_fn = JsdCrossEntropy(num_splits=num_aug_splits, smoothing=args.smoothing)
     elif mixup_active:
-        # smoothing is handled with mixup target transform which outputs sparse, soft targets
         if args.bce_loss:
             train_loss_fn = BinaryCrossEntropy(target_threshold=args.bce_target_thresh)
         else:
@@ -533,24 +552,28 @@ def main():
             train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
         train_loss_fn = nn.CrossEntropyLoss()
+
     validate_loss_fn = nn.CrossEntropyLoss().to(args.device)
 
     distiller = Distiller(model, teacher=teacher, criterion=train_loss_fn, args=args, num_data=len(dataset_train))
+
     student_params, extra_params = distiller.get_learnable_parameters()
     if args.rank == 0:
-        _logger.info(f'\n-------------------------------'
-                     f'\nLearnable parameters'
-                     f'\nStudent: {student_params / 1e6:.2f}M'
-                     f'\nExtra: {extra_params / 1e6:.2f}M'
-                     f'\n-------------------------------')
+        _logger.info(
+            f'\n-------------------------------'
+            f'\nLearnable parameters'
+            f'\nStudent: {student_params / 1e6:.2f}M'
+            f'\nExtra: {extra_params / 1e6:.2f}M'
+            f'\n-------------------------------'
+        )
 
     distiller = distiller.to(args.device)
 
     optimizer = create_optimizer_v2(distiller, **optimizer_kwargs(cfg=args))
 
-    # setup automatic mixed-precision (AMP) loss scaling and op casting
-    amp_autocast = suppress  # do nothing
+    amp_autocast = suppress
     loss_scaler = None
+
     if use_amp == 'apex':
         distiller, optimizer = amp.initialize(distiller, optimizer, opt_level='O1')
         loss_scaler = ApexScaler()
@@ -565,32 +588,61 @@ def main():
         if args.rank == 0:
             _logger.info('AMP not enabled. Training in float32.')
 
-    # setup exponential moving average of model weights, SWA could be used here too
     model_emas = None
     if args.model_ema:
-        # Important to create EMA model after cuda(), DP wrapper, and AMP but before DDP wrapper
         model_emas = []
         for decay in args.model_ema_decay:
             model_ema = ModelEmaV2(model, decay=decay, device='cpu' if args.model_ema_force_cpu else None)
             model_emas.append((model_ema, decay))
 
-    # setup distributed training
+    if args.experiment:
+        exp_name = args.experiment
+    else:
+        exp_name = '-'.join([
+            datetime.now().strftime("%Y%m%d-%H%M%S"),
+            safe_model_name(args.model),
+            str(data_config['input_size'][-1]),
+        ])
+
+    output_dir = os.path.join(args.output if args.output else './output/train', exp_name)
+
+    resume_epoch = None
+    if args.resume:
+        resume_path = os.path.join(output_dir, 'checkpoint', 'last.pth.tar')
+        if os.path.exists(resume_path):
+            resume_epoch = resume_checkpoint(
+                distiller,
+                resume_path,
+                optimizer=optimizer,
+                loss_scaler=loss_scaler,
+                log_info=args.rank == 0,
+            )
+            if args.rank == 0:
+                _logger.info(f'Resumed from {resume_path}; resume_epoch={resume_epoch}')
+        else:
+            if args.rank == 0:
+                _logger.warning(f'--resume set, but no checkpoint found at: {resume_path}')
+
     if args.distributed:
         if has_apex and use_amp == 'apex':
-            # Apex DDP preferred unless native amp is activated
             if args.rank == 0:
                 _logger.info("Using NVIDIA APEX DistributedDataParallel.")
             distiller = ApexDDP(distiller, delay_allreduce=True)
         else:
             if args.rank == 0:
                 _logger.info("Using native Torch DistributedDataParallel.")
-            distiller = NativeDDP(distiller, device_ids=[args.local_rank], output_device=args.local_rank,
-                                  broadcast_buffers=not args.no_ddp_bb)
-        # NOTE: EMA model does not need to be wrapped by DDP
+            distiller = NativeDDP(
+                distiller,
+                device_ids=[args.local_rank],
+                output_device=args.local_rank,
+                broadcast_buffers=not args.no_ddp_bb,
+            )
 
-    # setup learning rate schedule and starting epoch
     lr_scheduler, num_epochs = create_scheduler(args, optimizer)
+
     start_epoch = 0
+    if resume_epoch is not None:
+        start_epoch = resume_epoch
     if args.start_epoch is not None:
         start_epoch = args.start_epoch
 
@@ -599,29 +651,36 @@ def main():
 
     if args.rank == 0:
         _logger.info('Scheduled epochs: {}'.format(num_epochs))
+        if start_epoch > 0:
+            _logger.info(f'Starting from epoch {start_epoch}')
 
-    # setup mixup / cutmix
     collate_fn = None
     mixup_fn = None
+
     if mixup_active:
         mixup_args = dict(
-            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
-            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-            label_smoothing=args.smoothing, num_classes=args.num_classes)
+            mixup_alpha=args.mixup,
+            cutmix_alpha=args.cutmix,
+            cutmix_minmax=args.cutmix_minmax,
+            prob=args.mixup_prob,
+            switch_prob=args.mixup_switch_prob,
+            mode=args.mixup_mode,
+            label_smoothing=args.smoothing,
+            num_classes=args.num_classes,
+        )
         if args.prefetcher:
-            assert not num_aug_splits  # collate conflict (need to support deinterleaving in collate mixup)
+            assert not num_aug_splits
             collate_fn = FastCollateMixup(**mixup_args)
         else:
             mixup_fn = Mixup(**mixup_args)
 
-    # wrap dataset in AugMix helper
     if num_aug_splits > 1:
         dataset_train = AugMixDataset(dataset_train, num_splits=num_aug_splits)
 
-    # create data loaders w/ augmentation pipeiine
     train_interpolation = args.train_interpolation
     if args.no_aug or not train_interpolation:
         train_interpolation = data_config['interpolation']
+
     loader_train = create_loader(
         dataset_train,
         input_size=data_config['input_size'],
@@ -667,41 +726,47 @@ def main():
         pin_memory=args.pin_mem,
     )
 
-    # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric
     best_metric = None
     best_epoch = None
     saver = None
     ema_savers = [None] * len(model_emas) if model_emas is not None else None
-    output_dir = None
     tb_writer = None
+
     if args.rank == 0:
-        if args.experiment:
-            exp_name = args.experiment
-        else:
-            exp_name = '-'.join([
-                datetime.now().strftime("%Y%m%d-%H%M%S"),
-                safe_model_name(args.model),
-                str(data_config['input_size'][-1])
-            ])
-        output_dir = get_outdir(args.output if args.output else './output/train', exp_name)
+        os.makedirs(output_dir, exist_ok=True)
+
         decreasing = True if eval_metric == 'loss' else False
         saver_dir = os.path.join(output_dir, 'checkpoint')
-        os.makedirs(saver_dir)
+        os.makedirs(saver_dir, exist_ok=True)
+
         saver = CheckpointSaver(
-            model=model, optimizer=optimizer, args=args, amp_scaler=loss_scaler,
-            checkpoint_dir=saver_dir, recovery_dir=saver_dir, decreasing=decreasing,
-            max_history=args.checkpoint_hist)
+            model=distiller.module if hasattr(distiller, 'module') else distiller,
+            optimizer=optimizer,
+            args=args,
+            amp_scaler=loss_scaler,
+            checkpoint_dir=saver_dir,
+            recovery_dir=saver_dir,
+            decreasing=decreasing,
+            max_history=args.checkpoint_hist,
+        )
 
         if model_emas is not None:
             ema_savers = []
             for ema, decay in model_emas:
                 ema_saver_dir = os.path.join(output_dir, f'ema{decay}_checkpoint')
-                os.makedirs(ema_saver_dir)
+                os.makedirs(ema_saver_dir, exist_ok=True)
                 ema_saver = CheckpointSaver(
-                    model=model, optimizer=optimizer, args=args, model_ema=ema, amp_scaler=loss_scaler,
-                    checkpoint_dir=ema_saver_dir, recovery_dir=ema_saver_dir, decreasing=decreasing,
-                    max_history=args.checkpoint_hist)
+                    model=distiller.module if hasattr(distiller, 'module') else distiller,
+                    optimizer=optimizer,
+                    args=args,
+                    model_ema=ema,
+                    amp_scaler=loss_scaler,
+                    checkpoint_dir=ema_saver_dir,
+                    recovery_dir=ema_saver_dir,
+                    decreasing=decreasing,
+                    max_history=args.checkpoint_hist,
+                )
                 ema_savers.append(ema_saver)
 
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
@@ -716,6 +781,7 @@ def main():
 
     try:
         tp = TimePredictor(num_epochs - start_epoch)
+
         for epoch in range(start_epoch, num_epochs):
             eval_metrics = None
 
@@ -723,9 +789,19 @@ def main():
                 loader_train.sampler.set_epoch(epoch)
 
             train_metrics = train_one_epoch(
-                epoch, distiller, loader_train, optimizer, args,
-                lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
-                amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_emas=model_emas, mixup_fn=mixup_fn)
+                epoch,
+                distiller,
+                loader_train,
+                optimizer,
+                args,
+                lr_scheduler=lr_scheduler,
+                saver=saver,
+                output_dir=output_dir,
+                amp_autocast=amp_autocast,
+                loss_scaler=loss_scaler,
+                model_emas=model_emas,
+                mixup_fn=mixup_fn,
+            )
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                 if args.rank == 0:
@@ -734,9 +810,15 @@ def main():
 
             is_eval = epoch > int(args.eval_interval_end * args.epochs) or epoch % args.eval_interval == 0
             if not args.speedtest and is_eval:
-                eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
+                eval_model = distiller.module.student if hasattr(distiller, 'module') else distiller.student
+                eval_metrics = validate(eval_model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
+
                 val_dist_metrics = validate_distiller_losses(
-                    distiller, loader_eval, args, amp_autocast=amp_autocast)
+                    distiller,
+                    loader_eval,
+                    args,
+                    amp_autocast=amp_autocast,
+                )
                 eval_metrics.update(val_dist_metrics)
 
                 if tb_writer is not None:
@@ -750,31 +832,37 @@ def main():
                     tb_writer.flush()
 
                 if saver is not None:
-                    # save proper checkpoint with eval metric
                     save_metric = eval_metrics[eval_metric]
                     best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
 
                 if model_emas is not None and not args.model_ema_force_cpu:
                     for j, ((ema, decay), ema_saver) in enumerate(zip(model_emas, ema_savers)):
-
                         if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                             distribute_bn(ema, args.world_size, args.dist_bn == 'reduce')
 
-                        ema_eval_metrics = validate(ema.module, loader_eval, validate_loss_fn, args,
-                                                    amp_autocast=amp_autocast, log_suffix=f' (EMA {decay:.5f})')
+                        ema_eval_metrics = validate(
+                            ema.module,
+                            loader_eval,
+                            validate_loss_fn,
+                            args,
+                            amp_autocast=amp_autocast,
+                            log_suffix=f' (EMA {decay:.5f})',
+                        )
 
                         if ema_saver is not None:
-                            # save proper checkpoint with eval metric
                             save_metric = ema_eval_metrics[eval_metric]
                             ema_saver.save_checkpoint(epoch, metric=save_metric)
 
                 if output_dir is not None:
                     update_summary(
-                        epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
-                        write_header=best_metric is None)
+                        epoch,
+                        train_metrics,
+                        eval_metrics,
+                        os.path.join(output_dir, 'summary.csv'),
+                        write_header=best_metric is None and start_epoch == 0,
+                    )
 
             if lr_scheduler is not None and eval_metrics is not None:
-                # step LR for next epoch
                 lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
 
             tp.update()
