@@ -650,7 +650,7 @@ def main():
         resume_path = os.path.join(output_dir, 'checkpoint', 'last.pth.tar')
         if os.path.exists(resume_path):
             resume_epoch, resume_checkpoint = resume_checkpoint_full(
-                distiller,
+                model,
                 resume_path,
                 optimizer=optimizer,
                 loss_scaler=loss_scaler,
