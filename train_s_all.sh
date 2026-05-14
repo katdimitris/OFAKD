@@ -5,9 +5,9 @@ python -m torch.distributed.launch --nproc_per_node=4 --use_env train_distribute
   --teacher resnet50 \
   --teacher-pretrained ./teacher_weights/resnet50_a1.pth \
   --distiller conceptkd \
-  --concept-stages 4 \
-  --concept-mapping-stages stage4 \
-  --concept-mapping-temps 0.1 \
+  --concept-stages 1 2 3 4 \
+  --concept-mapping-stages stage1 stage2 stage3 stage4 \
+  --concept-mapping-temps 0.2 1.0 1.0 0.1 \
   --batch-size 256 \
   --amp \
   --output ./output \

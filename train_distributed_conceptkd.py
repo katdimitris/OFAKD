@@ -124,8 +124,23 @@ parser.add_argument('--rkd-eps', default=1e-12, type=float)
 parser.add_argument('--rkd-squared', action='store_true', default=False)
 
 # FitNet parameters
-parser.add_argument('--fitnet-stage', default=[1, 2, 3, 4], nargs='+', type=int)
+parser.add_argument('--fitnet-stage', default=[4], nargs='+', type=int)
 parser.add_argument('--fitnet-loss-weight', default=1, type=float)
+
+# ConceptKD parameters
+parser.add_argument("--concept-stages", default=[4], nargs="+", type=int)
+parser.add_argument("--concept-mapping-stages", default=["stage4"], nargs="+", type=str)
+
+parser.add_argument("--concept-loss-weight", default=1.0, type=float)
+parser.add_argument("--concept-dim", default=256, type=int)
+parser.add_argument("--concept-num-prototypes", default=2048, type=int)
+parser.add_argument("--concept-k", default=4096, type=int)
+parser.add_argument("--concept-sigma", default=0.1, type=float)
+parser.add_argument("--concept-sinkhorn-eps", default=0.05, type=float)
+parser.add_argument("--concept-sinkhorn-iters", default=3, type=int)
+parser.add_argument("--concept-mapping-path", default="./precomputed_receptive_fields/precomputed_resnet50_patch_mappings.pth", type=str)
+parser.add_argument("--concept-mapping-temps", default=[0.1], nargs="+", type=float) # [0.2, 1.0, 1.0, 0.1]
+parser.add_argument("--concept-mapping-topk", default=0, type=int)
 
 # Misc
 parser.add_argument('--speedtest', action='store_true')
@@ -397,7 +412,7 @@ def resume_checkpoint_full(model, checkpoint_path, optimizer=None, loss_scaler=N
     if log_info:
         _logger.info(f'Loaded checkpoint {checkpoint_path}; resume_epoch={resume_epoch}')
 
-    return resume_epoch
+    return resume_epoch, checkpoint
 
 def main():
     setup_default_logging(log_path='train.log')
@@ -614,12 +629,6 @@ def main():
         if args.rank == 0:
             _logger.info('AMP not enabled. Training in float32.')
 
-    model_emas = None
-    if args.model_ema:
-        model_emas = []
-        for decay in args.model_ema_decay:
-            model_ema = ModelEmaV2(model, decay=decay, device='cpu' if args.model_ema_force_cpu else None)
-            model_emas.append((model_ema, decay))
 
     if args.experiment:
         exp_name = args.experiment
@@ -632,22 +641,51 @@ def main():
 
     output_dir = os.path.join(args.output if args.output else './output/train', exp_name)
 
+    lr_scheduler, num_epochs = create_scheduler(args, optimizer)
+
     resume_epoch = None
+    resume_checkpoint = None
+
     if args.resume:
         resume_path = os.path.join(output_dir, 'checkpoint', 'last.pth.tar')
         if os.path.exists(resume_path):
-            resume_epoch = resume_checkpoint_full(
+            resume_epoch, resume_checkpoint = resume_checkpoint_full(
                 distiller,
                 resume_path,
                 optimizer=optimizer,
                 loss_scaler=loss_scaler,
                 log_info=args.rank == 0,
             )
+
             if args.rank == 0:
                 _logger.info(f'Resumed from {resume_path}; resume_epoch={resume_epoch}')
+
+            if lr_scheduler is not None and resume_checkpoint is not None:
+                if 'lr_scheduler' in resume_checkpoint:
+                    lr_scheduler.load_state_dict(resume_checkpoint['lr_scheduler'])
+                    if args.rank == 0:
+                        _logger.info('Loaded LR scheduler state from checkpoint.')
+                else:
+                    lr_scheduler.step(resume_epoch)
+                    if args.rank == 0:
+                        _logger.warning('No LR scheduler state in checkpoint; stepped scheduler manually.')
+
         else:
             if args.rank == 0:
                 _logger.warning(f'--resume set, but no checkpoint found at: {resume_path}')
+
+    model_emas = None
+    if args.model_ema:
+        model_emas = []
+        student_for_ema = distiller.student if hasattr(distiller, 'student') else model
+
+        for decay in args.model_ema_decay:
+            model_ema = ModelEmaV2(
+                student_for_ema,
+                decay=decay,
+                device='cpu' if args.model_ema_force_cpu else None,
+            )
+            model_emas.append((model_ema, decay))
 
     if args.distributed:
         if has_apex and use_amp == 'apex':
@@ -664,15 +702,13 @@ def main():
                 broadcast_buffers=not args.no_ddp_bb,
             )
 
-    lr_scheduler, num_epochs = create_scheduler(args, optimizer)
-
     start_epoch = 0
     if resume_epoch is not None:
         start_epoch = resume_epoch
     if args.start_epoch is not None:
         start_epoch = args.start_epoch
 
-    if lr_scheduler is not None and start_epoch > 0:
+    if lr_scheduler is not None and start_epoch > 0 and resume_checkpoint is None:
         lr_scheduler.step(start_epoch)
 
     if args.rank == 0:
